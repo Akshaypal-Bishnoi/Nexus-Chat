@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+langchain
+langchain-core
+langchain-openai
+langgraph
+langgraph-checkpoint-postgres
+chromadb
+python-dotenv
+psycopg
+psycopg-pool
+mcp
