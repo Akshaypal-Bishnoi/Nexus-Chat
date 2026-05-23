@@ -5,6 +5,10 @@ import asyncio
 # Fix for Windows: psycopg (async Postgres driver) requires SelectorEventLoop
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8')
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, File, UploadFile
@@ -146,4 +150,4 @@ async def chat_stream_endpoint(req: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, loop="asyncio")
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
