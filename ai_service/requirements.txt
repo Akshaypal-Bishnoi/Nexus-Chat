@@ -10,3 +10,10 @@ python-dotenv
 psycopg
 psycopg-pool
 mcp
+langchain-chroma
+langchain-community
+langchain-mcp-adapters
+langchain-tavily
+tavily-python
+pypdf
+python-multipart

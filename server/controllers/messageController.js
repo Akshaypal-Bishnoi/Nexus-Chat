@@ -97,7 +97,8 @@ export const sendMessage = async (req, res) =>{
         const isAICall = text && text.trim().startsWith("@AI");
         
         if (text && !isAICall && !isDirectAI) {
-            fetch("http://127.0.0.1:8000/api/embed", {
+            const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
+            fetch(`${pythonUrl}/api/embed`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -136,7 +137,8 @@ export const sendMessage = async (req, res) =>{
                     }
 
                     // Call Python FastAPI Streaming Endpoint
-                    const response = await fetch("http://127.0.0.1:8000/api/chat/stream", {
+                    const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
+                    const response = await fetch(`${pythonUrl}/api/chat/stream`, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({
