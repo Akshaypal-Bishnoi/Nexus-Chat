@@ -50,12 +50,24 @@ async def lifespan(app: FastAPI):
     if not POSTGRES_URI:
         raise RuntimeError("POSTGRES_DB_URI is not set in .env!")
 
+    from psycopg_pool import AsyncConnectionPool
+
+    # Create a connection pool with max_idle < 300s (Neon scale-to-zero limit)
+    # This prevents the "terminating connection due to administrator command" error
+    pool = AsyncConnectionPool(
+        conninfo=POSTGRES_URI,
+        max_size=20,
+        max_idle=240.0,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
+    )
+
     # Create the async Postgres checkpointer and set up the DB tables
-    async with AsyncPostgresSaver.from_conn_string(POSTGRES_URI) as saver:
+    async with pool:
+        saver = AsyncPostgresSaver(conn=pool)
         await saver.setup()  # Creates the langgraph checkpoint tables automatically
         checkpointer = saver
         
-        print("✅ PostgreSQL checkpointer connected and ready!")
+        print("✅ PostgreSQL checkpointer connected and ready (Pool Mode)!")
         
         # Initialize MCP tools and compile agent with the checkpointer
         llm, tools = await init_mcp()
