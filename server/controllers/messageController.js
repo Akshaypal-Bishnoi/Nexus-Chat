@@ -149,6 +149,17 @@ export const sendMessage = async (req, res) =>{
                         })
                     });
                     
+                    if (!response.ok) {
+                        console.error("Python API Error:", response.status);
+                        const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service is currently waking up or unavailable. Render free tier takes ~50 seconds to wake up. Please wait a moment and try again.]";
+                        
+                        if (senderSocketId) io.to(senderSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
+                        if (receiverSocketId && receiverSocketId !== senderSocketId) io.to(receiverSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
+                        
+                        await Message.findByIdAndUpdate(aiMessage._id, { text: fallbackMsg });
+                        return;
+                    }
+
                     const reader = response.body.getReader();
                     const decoder = new TextDecoder("utf-8");
                     let fullText = aiPrefix;
