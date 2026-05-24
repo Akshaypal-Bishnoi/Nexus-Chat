@@ -139,6 +139,11 @@ async def embed_message(req: EmbedRequest):
         print(f"Embedding error: {e}")
         return {"status": "error", "detail": str(e)}
 
+@app.get("/health")
+async def health_check():
+    """Simple endpoint to verify the API is awake and running."""
+    return {"status": "awake", "message": "NexusChat AI Service is running!"}
+
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest):
     global agent_app
