@@ -12,7 +12,7 @@ export const ChatProvider = ({ children })=>{
     const [selectedUser, setSelectedUser] = useState(null)
     const [unseenMessages, setUnseenMessages] = useState({})
 
-    const {socket, axios} = useContext(AuthContext);
+    const {socket, axios, authUser} = useContext(AuthContext);
 
     // function to get all users for sidebar
     const getUsers = async () =>{
@@ -58,11 +58,17 @@ export const ChatProvider = ({ children })=>{
         if(!socket) return;
 
         socket.on("newMessage", (newMessage)=>{
-            if(selectedUser && newMessage.senderId === selectedUser._id){
+            // If the message is part of the currently active 1-on-1 chat
+            if(selectedUser && (newMessage.senderId === selectedUser._id || newMessage.receiverId === selectedUser._id)){
                 newMessage.seen = true;
-                setMessages((prevMessages)=> [...prevMessages, newMessage]);
-                axios.put(`/api/messages/mark/${newMessage._id}`);
-            }else{
+                setMessages((prevMessages)=> {
+                    // Prevent duplicates
+                    if (prevMessages.some(m => m._id === newMessage._id)) return prevMessages;
+                    return [...prevMessages, newMessage];
+                });
+                axios.put(`/api/messages/mark/${newMessage._id}`).catch(e => console.log(e));
+            }else if (authUser && newMessage.senderId !== authUser._id) {
+                // If it's from someone else and not our active chat, increment unseen count
                 setUnseenMessages((prevUnseenMessages)=>({
                     ...prevUnseenMessages, [newMessage.senderId] : prevUnseenMessages[newMessage.senderId] ? prevUnseenMessages[newMessage.senderId] + 1 : 1
                 }))
