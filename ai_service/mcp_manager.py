@@ -35,13 +35,16 @@ class MCPManager:
                     env=env
                 )
                 
-                # Correctly handle the async context managers using AsyncExitStack
-                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-                read, write = stdio_transport
+                import asyncio
                 
-                session = await self.exit_stack.enter_async_context(ClientSession(read, write))
-                
-                await session.initialize()
+                async def connect_mcp():
+                    stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+                    read, write = stdio_transport
+                    session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+                    await session.initialize()
+                    return session
+
+                session = await asyncio.wait_for(connect_mcp(), timeout=15.0)
                 self.sessions[server_name] = session
                 print(f"✅ Successfully connected to MCP Server: {server_name}")
                 
@@ -52,8 +55,13 @@ class MCPManager:
         """Fetches tools using the official LangChain MCP adapter."""
         for server_name, session in self.sessions.items():
             
-            # Let LangChain handle the complex conversion!
-            mcp_tools = await load_mcp_tools(session)
+            try:
+                # Let LangChain handle the complex conversion!
+                import asyncio
+                mcp_tools = await asyncio.wait_for(load_mcp_tools(session), timeout=15.0)
+            except Exception as e:
+                print(f"❌ Failed to load tools from {server_name}: {e}")
+                continue
             
             for tool in mcp_tools:
                 # We rename them slightly just to prevent collisions if two 
