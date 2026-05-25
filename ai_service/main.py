@@ -27,6 +27,8 @@ load_dotenv()
 # Global graph instance & checkpointer
 agent_app = None
 checkpointer = None
+startup_error = None
+background_tasks = set()
 
 class ChatRequest(BaseModel):
     message: str
@@ -42,7 +44,7 @@ class EmbedRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Handles startup and shutdown with proper async context management."""
-    global agent_app, checkpointer
+    global agent_app, checkpointer, startup_error, background_tasks
 
     print("🚀 Starting up NexusChat AI Service...")
     
@@ -62,7 +64,7 @@ async def lifespan(app: FastAPI):
     )
 
     async def init_background():
-        global agent_app, checkpointer
+        global agent_app, checkpointer, startup_error
         try:
             # Create the async Postgres checkpointer and set up the DB tables
             saver = AsyncPostgresSaver(conn=pool)
@@ -76,11 +78,15 @@ async def lifespan(app: FastAPI):
             agent_app = graph.compile(checkpointer=checkpointer)
             print("✅ AI Agent compiled with persistent memory!")
         except Exception as e:
+            startup_error = str(e)
             print(f"❌ Failed to initialize agent: {e}")
 
     async with pool:
         # Run the slow initialization in the background so FastAPI binds to the port instantly
-        asyncio.create_task(init_background())
+        # Keep a strong reference to the task so the garbage collector doesn't kill it!
+        task = asyncio.create_task(init_background())
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
         
         yield  # Server runs here
         
@@ -100,7 +106,9 @@ app.add_middleware(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "agent_ready": agent_app is not None}
+    if startup_error:
+        return {"status": "error", "message": f"Startup crashed: {startup_error}"}
+    return {"status": "awake", "agent_ready": agent_app is not None}
 
 @app.post("/api/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -144,11 +152,6 @@ async def embed_message(req: EmbedRequest):
     except Exception as e:
         print(f"Embedding error: {e}")
         return {"status": "error", "detail": str(e)}
-
-@app.get("/health")
-async def health_check():
-    """Simple endpoint to verify the API is awake and running."""
-    return {"status": "awake", "message": "NexusChat AI Service is running!"}
 
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest):

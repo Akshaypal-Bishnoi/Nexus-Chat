@@ -187,6 +187,12 @@ export const sendMessage = async (req, res) =>{
 
                 } catch (aiError) {
                     console.error("AI Streaming Error:", aiError.message);
+                    if (aiMessage) {
+                        const fallbackMsg = (isDirectAI ? "" : "[🤖 AI Co-Pilot]: ") + "\n[⚠️ The AI Service is completely unreachable right now (Network Error). Please try again.]";
+                        if (senderSocketId) io.to(senderSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
+                        if (receiverSocketId && receiverSocketId !== senderSocketId) io.to(receiverSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
+                        await Message.findByIdAndUpdate(aiMessage._id, { text: fallbackMsg }).catch(e => console.error(e));
+                    }
                 }
             })();
         }
