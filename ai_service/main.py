@@ -61,20 +61,26 @@ async def lifespan(app: FastAPI):
         kwargs={"autocommit": True, "prepare_threshold": 0},
     )
 
-    # Create the async Postgres checkpointer and set up the DB tables
+    async def init_background():
+        global agent_app, checkpointer
+        try:
+            # Create the async Postgres checkpointer and set up the DB tables
+            saver = AsyncPostgresSaver(conn=pool)
+            await saver.setup()
+            checkpointer = saver
+            print("✅ PostgreSQL checkpointer connected and ready (Pool Mode)!")
+            
+            print("⏳ Initializing MCP tools in background (this might take ~60s)...")
+            llm, tools = await init_mcp()
+            graph = create_agent_graph(llm, tools)
+            agent_app = graph.compile(checkpointer=checkpointer)
+            print("✅ AI Agent compiled with persistent memory!")
+        except Exception as e:
+            print(f"❌ Failed to initialize agent: {e}")
+
     async with pool:
-        saver = AsyncPostgresSaver(conn=pool)
-        await saver.setup()  # Creates the langgraph checkpoint tables automatically
-        checkpointer = saver
-        
-        print("✅ PostgreSQL checkpointer connected and ready (Pool Mode)!")
-        
-        # Initialize MCP tools and compile agent with the checkpointer
-        llm, tools = await init_mcp()
-        graph = create_agent_graph(llm, tools)
-        agent_app = graph.compile(checkpointer=checkpointer)
-        
-        print("✅ AI Agent compiled with persistent memory!")
+        # Run the slow initialization in the background so FastAPI binds to the port instantly
+        asyncio.create_task(init_background())
         
         yield  # Server runs here
         
@@ -147,8 +153,15 @@ async def health_check():
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest):
     global agent_app
+    
+    # Wait up to 60 seconds if the agent is still downloading tools in the background
+    for _ in range(60):
+        if agent_app is not None:
+            break
+        await asyncio.sleep(1)
+        
     if not agent_app:
-        raise HTTPException(status_code=503, detail="Agent not ready")
+        raise HTTPException(status_code=503, detail="Agent is still starting up, please try again in a minute.")
 
     async def generate():
         try:
