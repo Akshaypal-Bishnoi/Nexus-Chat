@@ -15,6 +15,10 @@ class MCPManager:
 
     async def connect_all(self):
         """Connects to all MCP servers defined in the config file."""
+        if os.environ.get("RENDER"):
+            print("☁️ Running on Render Cloud. Skipping local MCP servers (NPM consumes too much memory for free tier).")
+            return
+
         if not os.path.exists(self.config_path):
             print(f"Warning: {self.config_path} not found. No MCP servers connected.")
             return
