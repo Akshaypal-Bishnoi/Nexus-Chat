@@ -1,6 +1,7 @@
 import os
 import sys
 import asyncio
+import traceback
 
 # Fix for Windows: psycopg (async Postgres driver) requires SelectorEventLoop
 if sys.platform == "win32":
@@ -17,15 +18,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from psycopg_pool import AsyncConnectionPool
 
 load_dotenv()
 
-# Global State 
+# ── Global State ──
 agent_app = None
-pool = None
-_init_task = None  # strong reference so GC doesn't kill it
+_init_task = None
+_last_error = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -38,70 +37,84 @@ class EmbedRequest(BaseModel):
     chat_id: str
     sender_id: str
 
-# Initialization with Retry
+# ── Initialization with Retry ──
 MAX_RETRIES = 10
-RETRY_DELAY = 10  # seconds between retries
+RETRY_DELAY = 15  # seconds between retries
 
-async def init_agent(pg_pool):
+async def init_agent():
     """Initialize the AI agent. Retries up to MAX_RETRIES times if anything fails."""
-    global agent_app
+    global agent_app, _last_error
+
+    POSTGRES_URI = os.getenv("POSTGRES_DB_URI")
+    if not POSTGRES_URI:
+        _last_error = "POSTGRES_DB_URI not set!"
+        print(f"🚨 {_last_error}")
+        return
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"\n🔄 Initialization attempt {attempt}/{MAX_RETRIES}...")
+            print(f"\n🔄 Init attempt {attempt}/{MAX_RETRIES}...")
+            _last_error = None
 
-            # Step 1: Connect checkpointer to Neon DB
+            # Step 1: Connect to Neon DB (with retry-friendly settings)
             print("  → Connecting to Neon PostgreSQL...")
-            saver = AsyncPostgresSaver(conn=pg_pool)
+            from psycopg_pool import AsyncConnectionPool
+            from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+            pool = AsyncConnectionPool(
+                conninfo=POSTGRES_URI,
+                min_size=0,       # DON'T eagerly connect — Neon might be asleep
+                max_size=5,
+                max_idle=240.0,
+                timeout=30.0,
+                kwargs={"autocommit": True, "prepare_threshold": 0},
+            )
+            await pool.open()     # opens lazily since min_size=0
+            
+            saver = AsyncPostgresSaver(conn=pool)
             await saver.setup()
             print("  ✅ PostgreSQL checkpointer ready.")
 
-            # Step 2: Build agent (imports crag_tool lazily so module-level errors are caught here)
-            print("  → Building AI agent graph...")
+            # Step 2: Build the agent
+            print("  → Building AI agent...")
             from agent import init_mcp, create_agent_graph
             llm, tools = await init_mcp()
             graph = create_agent_graph(llm, tools)
             agent_app = graph.compile(checkpointer=saver)
 
             print(f"✅ AI Agent is LIVE! (attempt {attempt})")
-            return  # success — exit the retry loop
+            return  # success
 
         except Exception as e:
+            _last_error = f"Attempt {attempt}: {e}"
             print(f"❌ Attempt {attempt} failed: {e}")
+            traceback.print_exc()
             if attempt < MAX_RETRIES:
                 print(f"   Retrying in {RETRY_DELAY}s...")
                 await asyncio.sleep(RETRY_DELAY)
             else:
-                print("🚨 All initialization attempts failed. The /chat endpoint will return 503.")
+                print("🚨 All init attempts exhausted. /chat will return 503.")
 
-# Lifespan
+# ── Lifespan ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pool, _init_task
+    global _init_task
 
     print("🚀 Starting NexusChat AI Service...")
 
-    POSTGRES_URI = os.getenv("POSTGRES_DB_URI")
-    if not POSTGRES_URI:
-        raise RuntimeError("POSTGRES_DB_URI is not set!")
+    # Launch init entirely in background — no pool, no DB, nothing blocking here.
+    # This guarantees FastAPI binds to the port in <1 second so Render never kills us.
+    _init_task = asyncio.create_task(init_agent())
 
-    pool = AsyncConnectionPool(
-        conninfo=POSTGRES_URI,
-        max_size=10,
-        max_idle=240.0,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
-    )
+    yield  # server is running
 
-    async with pool:
-        # Launch init in background so FastAPI binds to port immediately (Render won't kill us)
-        _init_task = asyncio.create_task(init_agent(pool))
-
-        yield  # server is running
-
-        # Shutdown
-        print("🛑 Shutting down...")
+    # Shutdown
+    print("🛑 Shutting down...")
+    try:
         from agent import mcp_manager
         await mcp_manager.cleanup()
+    except Exception:
+        pass
 
 app = FastAPI(title="NexusChat AI Service", lifespan=lifespan)
 
@@ -113,11 +126,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#Endpoints
+# ── Endpoints ──
 
 @app.get("/health")
 async def health_check():
-    return {"status": "awake", "agent_ready": agent_app is not None}
+    return {
+        "status": "awake",
+        "agent_ready": agent_app is not None,
+        "last_error": _last_error,
+    }
 
 @app.post("/api/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
@@ -159,14 +176,17 @@ async def embed_message(req: EmbedRequest):
 
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest):
-    # Wait up to 90 seconds for the agent to finish initializing (covers retries)
-    for _ in range(90):
+    # Wait up to 120 seconds for the agent (covers retries + Neon wake-up)
+    for _ in range(120):
         if agent_app is not None:
             break
         await asyncio.sleep(1)
 
     if not agent_app:
-        raise HTTPException(status_code=503, detail="Agent is still starting up. Please try again in a minute.")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Agent not ready. Last error: {_last_error}"
+        )
 
     async def generate():
         try:
