@@ -17,18 +17,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
-# pyrefly: ignore [missing-import]
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-from agent import init_mcp, create_agent_graph, mcp_manager
+from psycopg_pool import AsyncConnectionPool
 
 load_dotenv()
 
-# Global graph instance & checkpointer
+# Global State 
 agent_app = None
-checkpointer = None
-startup_error = None
-background_tasks = set()
+pool = None
+_init_task = None  # strong reference so GC doesn't kill it
 
 class ChatRequest(BaseModel):
     message: str
@@ -41,57 +38,69 @@ class EmbedRequest(BaseModel):
     chat_id: str
     sender_id: str
 
+# Initialization with Retry
+MAX_RETRIES = 10
+RETRY_DELAY = 10  # seconds between retries
+
+async def init_agent(pg_pool):
+    """Initialize the AI agent. Retries up to MAX_RETRIES times if anything fails."""
+    global agent_app
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            print(f"\n🔄 Initialization attempt {attempt}/{MAX_RETRIES}...")
+
+            # Step 1: Connect checkpointer to Neon DB
+            print("  → Connecting to Neon PostgreSQL...")
+            saver = AsyncPostgresSaver(conn=pg_pool)
+            await saver.setup()
+            print("  ✅ PostgreSQL checkpointer ready.")
+
+            # Step 2: Build agent (imports crag_tool lazily so module-level errors are caught here)
+            print("  → Building AI agent graph...")
+            from agent import init_mcp, create_agent_graph
+            llm, tools = await init_mcp()
+            graph = create_agent_graph(llm, tools)
+            agent_app = graph.compile(checkpointer=saver)
+
+            print(f"✅ AI Agent is LIVE! (attempt {attempt})")
+            return  # success — exit the retry loop
+
+        except Exception as e:
+            print(f"❌ Attempt {attempt} failed: {e}")
+            if attempt < MAX_RETRIES:
+                print(f"   Retrying in {RETRY_DELAY}s...")
+                await asyncio.sleep(RETRY_DELAY)
+            else:
+                print("🚨 All initialization attempts failed. The /chat endpoint will return 503.")
+
+# Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Handles startup and shutdown with proper async context management."""
-    global agent_app, checkpointer, startup_error, background_tasks
+    global pool, _init_task
 
-    print("🚀 Starting up NexusChat AI Service...")
-    
+    print("🚀 Starting NexusChat AI Service...")
+
     POSTGRES_URI = os.getenv("POSTGRES_DB_URI")
     if not POSTGRES_URI:
-        raise RuntimeError("POSTGRES_DB_URI is not set in .env!")
+        raise RuntimeError("POSTGRES_DB_URI is not set!")
 
-    from psycopg_pool import AsyncConnectionPool
-
-    # Create a connection pool with max_idle < 300s (Neon scale-to-zero limit)
-    # This prevents the "terminating connection due to administrator command" error
     pool = AsyncConnectionPool(
         conninfo=POSTGRES_URI,
-        max_size=20,
+        max_size=10,
         max_idle=240.0,
         kwargs={"autocommit": True, "prepare_threshold": 0},
     )
 
-    async def init_background():
-        global agent_app, checkpointer, startup_error
-        try:
-            # Create the async Postgres checkpointer and set up the DB tables
-            saver = AsyncPostgresSaver(conn=pool)
-            await saver.setup()
-            checkpointer = saver
-            print("✅ PostgreSQL checkpointer connected and ready (Pool Mode)!")
-            
-            print("⏳ Initializing MCP tools in background (this might take ~60s)...")
-            llm, tools = await init_mcp()
-            graph = create_agent_graph(llm, tools)
-            agent_app = graph.compile(checkpointer=checkpointer)
-            print("✅ AI Agent compiled with persistent memory!")
-        except Exception as e:
-            startup_error = str(e)
-            print(f"❌ Failed to initialize agent: {e}")
-
     async with pool:
-        # Run the slow initialization in the background so FastAPI binds to the port instantly
-        # Keep a strong reference to the task so the garbage collector doesn't kill it!
-        task = asyncio.create_task(init_background())
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-        
-        yield  # Server runs here
-        
+        # Launch init in background so FastAPI binds to port immediately (Render won't kill us)
+        _init_task = asyncio.create_task(init_agent(pool))
+
+        yield  # server is running
+
         # Shutdown
-        print("🛑 Shutting down AI Service...")
+        print("🛑 Shutting down...")
+        from agent import mcp_manager
         await mcp_manager.cleanup()
 
 app = FastAPI(title="NexusChat AI Service", lifespan=lifespan)
@@ -104,50 +113,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+#Endpoints
+
 @app.get("/health")
 async def health_check():
-    if startup_error:
-        return {"status": "error", "message": f"Startup crashed: {startup_error}"}
     return {"status": "awake", "agent_ready": agent_app is not None}
 
 @app.post("/api/upload_pdf")
 async def upload_pdf(file: UploadFile = File(...)):
     import shutil
-    import os
     if not file.filename.endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
-        
+
     temp_path = f"temp_{file.filename}"
     try:
-        # Save file locally temporarily
         with open(temp_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
-        # Process and store in Chroma
+
         from crag_tool import process_and_store_pdf
         chunks = process_and_store_pdf(temp_path, file.filename)
-        
-        return {"status": "success", "message": f"Successfully learned from {file.filename} ({chunks} chunks)."}
+        return {"status": "success", "message": f"Learned from {file.filename} ({chunks} chunks)."}
     except Exception as e:
         print(f"PDF Upload Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
 @app.post("/api/embed")
 async def embed_message(req: EmbedRequest):
-    """Eavesdropper endpoint: receives normal chat messages and adds them to ChromaDB"""
+    """Receives normal chat messages and adds them to ChromaDB."""
     try:
-        from crag_tool import vector_store
+        from crag_tool import get_vector_store
         from langchain_core.documents import Document
-        
+
         doc = Document(
             page_content=req.text,
             metadata={"chat_id": req.chat_id, "sender_id": req.sender_id, "source": "chat"}
         )
-        vector_store.add_documents([doc])
+        get_vector_store().add_documents([doc])
         return {"status": "success"}
     except Exception as e:
         print(f"Embedding error: {e}")
@@ -155,29 +159,25 @@ async def embed_message(req: EmbedRequest):
 
 @app.post("/api/chat/stream")
 async def chat_stream_endpoint(req: ChatRequest):
-    global agent_app
-    
-    # Wait up to 60 seconds if the agent is still downloading tools in the background
-    for _ in range(60):
+    # Wait up to 90 seconds for the agent to finish initializing (covers retries)
+    for _ in range(90):
         if agent_app is not None:
             break
         await asyncio.sleep(1)
-        
+
     if not agent_app:
-        raise HTTPException(status_code=503, detail="Agent is still starting up, please try again in a minute.")
+        raise HTTPException(status_code=503, detail="Agent is still starting up. Please try again in a minute.")
 
     async def generate():
         try:
             inputs = {"messages": [HumanMessage(content=req.message)]}
-            # thread_id is per-chat-room, so each conversation has its own memory!
-            # We also pass the role so the agent knows which persona to use.
             config = {"configurable": {"thread_id": req.chat_id, "role": req.role}}
-            
+
             async for msg, metadata in agent_app.astream(inputs, stream_mode="messages", config=config):
                 if msg.content and metadata.get("langgraph_node") == "agent":
                     yield msg.content
         except Exception as e:
-            print(f"Error in stream: {e}")
+            print(f"Stream error: {e}")
             yield f"\n[Error: {str(e)}]"
 
     return StreamingResponse(generate(), media_type="text/plain")

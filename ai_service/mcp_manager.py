@@ -1,81 +1,84 @@
-import json
 import os
-from typing import Dict, List, Any
-from contextlib import AsyncExitStack
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from langchain_mcp_adapters.tools import load_mcp_tools
+from typing import List, Any
 
 class MCPManager:
-    def __init__(self, config_path: str = "mcp_config.json"):
-        self.config_path = config_path
-        self.sessions: Dict[str, ClientSession] = {}
-        self.exit_stack = AsyncExitStack()
+    """Manages MCP server connections. Only active in local development."""
+
+    def __init__(self):
         self.tools: List[Any] = []
 
     async def connect_all(self):
-        """Connects to all MCP servers defined in the config file."""
+        # MCP tools (filesystem, github) use npx and only work locally.
+        # On Render, we skip them entirely — they consume too much memory
+        # and reference local paths like c:/dev/NexusChat that don't exist.
         if os.environ.get("RENDER"):
-            print("☁️ Running on Render Cloud. Skipping local MCP servers (NPM consumes too much memory for free tier).")
+            print("☁️ Render detected — skipping local MCP servers.")
             return
 
-        if not os.path.exists(self.config_path):
-            print(f"Warning: {self.config_path} not found. No MCP servers connected.")
-            return
+        # Only import heavy MCP dependencies when actually needed (local dev)
+        try:
+            import json
+            from contextlib import AsyncExitStack
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
 
-        with open(self.config_path, "r") as f:
-            config = json.load(f)
+            config_path = "mcp_config.json"
+            if not os.path.exists(config_path):
+                print(f"Warning: {config_path} not found.")
+                return
 
-        for server_name, server_details in config.get("mcpServers", {}).items():
-            try:
-                command = server_details.get("command")
-                args = server_details.get("args", [])
-                env = server_details.get("env", None)
-                
-                # Setup Stdio params
-                server_params = StdioServerParameters(
-                    command=command,
-                    args=args,
-                    env=env
-                )
-                
-                import asyncio
-                
-                async def connect_mcp():
-                    stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-                    read, write = stdio_transport
-                    session = await self.exit_stack.enter_async_context(ClientSession(read, write))
-                    await session.initialize()
-                    return session
+            self._exit_stack = AsyncExitStack()
 
-                session = await asyncio.wait_for(connect_mcp(), timeout=15.0)
-                self.sessions[server_name] = session
-                print(f"✅ Successfully connected to MCP Server: {server_name}")
-                
-            except Exception as e:
-                print(f"❌ Failed to connect to MCP Server {server_name}: {e}")
+            with open(config_path, "r") as f:
+                config = json.load(f)
+
+            for name, details in config.get("mcpServers", {}).items():
+                try:
+                    import asyncio
+                    params = StdioServerParameters(
+                        command=details.get("command"),
+                        args=details.get("args", []),
+                        env=details.get("env", None),
+                    )
+
+                    async def _connect():
+                        transport = await self._exit_stack.enter_async_context(stdio_client(params))
+                        read, write = transport
+                        session = await self._exit_stack.enter_async_context(ClientSession(read, write))
+                        await session.initialize()
+                        return session
+
+                    session = await asyncio.wait_for(_connect(), timeout=15.0)
+                    self._sessions[name] = session
+                    print(f"✅ MCP Server connected: {name}")
+                except Exception as e:
+                    print(f"❌ MCP Server {name} failed: {e}")
+
+        except ImportError as e:
+            print(f"MCP dependencies not available: {e}")
 
     async def load_tools(self):
-        """Fetches tools using the official LangChain MCP adapter."""
-        for server_name, session in self.sessions.items():
-            
-            try:
-                # Let LangChain handle the complex conversion!
-                import asyncio
-                mcp_tools = await asyncio.wait_for(load_mcp_tools(session), timeout=15.0)
-            except Exception as e:
-                print(f"❌ Failed to load tools from {server_name}: {e}")
-                continue
-            
-            for tool in mcp_tools:
-                # We rename them slightly just to prevent collisions if two 
-                # different servers have a tool with the exact same name
-                tool.name = f"{server_name}_{tool.name}".replace("-", "_")
-                self.tools.append(tool)
-                print(f"🔧 Loaded tool via adapter: {tool.name}")
-        
+        if not hasattr(self, '_sessions'):
+            return self.tools
+
+        try:
+            import asyncio
+            from langchain_mcp_adapters.tools import load_mcp_tools
+
+            for name, session in self._sessions.items():
+                try:
+                    mcp_tools = await asyncio.wait_for(load_mcp_tools(session), timeout=15.0)
+                    for tool in mcp_tools:
+                        tool.name = f"{name}_{tool.name}".replace("-", "_")
+                        self.tools.append(tool)
+                        print(f"🔧 Loaded: {tool.name}")
+                except Exception as e:
+                    print(f"❌ Failed to load tools from {name}: {e}")
+        except ImportError:
+            pass
+
         return self.tools
 
     async def cleanup(self):
-        """Close all connections."""
-        await self.exit_stack.aclose()
+        if hasattr(self, '_exit_stack'):
+            await self._exit_stack.aclose()

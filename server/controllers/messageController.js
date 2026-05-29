@@ -90,9 +90,7 @@ export const sendMessage = async (req, res) =>{
             io.to(receiverSocketId).emit("newMessage", newMessage)
         }
 
-        // ============================
         // VECTOR DATABASE EAVESDROPPER
-        // ============================
         // If it's a normal text message (not an AI command, and not sent directly to AI), embed it
         const isAICall = text && text.trim().startsWith("@AI");
         
@@ -109,9 +107,7 @@ export const sendMessage = async (req, res) =>{
             }).catch(err => console.error("ChromaDB Sync Error:", err.message));
         }
 
-        // ============================
         // AI CO-PILOT & DIRECT AI INTEGRATION
-        // ============================
         if (isDirectAI || isAICall) {
             const query = isDirectAI ? text : text.replace("@AI", "").trim();
             
