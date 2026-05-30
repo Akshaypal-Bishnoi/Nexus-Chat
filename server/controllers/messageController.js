@@ -134,19 +134,40 @@ export const sendMessage = async (req, res) =>{
 
                     // Call Python FastAPI Streaming Endpoint
                     const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
-                    const response = await fetch(`${pythonUrl}/api/chat/stream`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            message: query,
-                            user_id: senderId.toString(),
-                            chat_id: receiverId.toString(),
-                            role: isDirectAI ? "assistant" : "copilot"
-                        })
-                    });
                     
-                    if (!response.ok) {
-                        console.error("Python API Error:", response.status);
+                    let response;
+                    let retries = 20; // Wait up to 100 seconds (20 * 5s) for Render cold starts
+                    
+                    while (retries > 0) {
+                        try {
+                            response = await fetch(`${pythonUrl}/api/chat/stream`, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    message: query,
+                                    user_id: senderId.toString(),
+                                    chat_id: receiverId.toString(),
+                                    role: isDirectAI ? "assistant" : "copilot"
+                                })
+                            });
+                            
+                            if (response.ok) {
+                                break; // Success! Exit the retry loop.
+                            }
+                            console.log(`Python API returned ${response.status}. Retrying... (${retries} left)`);
+                        } catch (e) {
+                            console.log(`Network error connecting to Python API: ${e.message}. Retrying... (${retries} left)`);
+                        }
+                        
+                        retries--;
+                        if (retries > 0) {
+                            // Wait 5 seconds before trying again
+                            await new Promise(resolve => setTimeout(resolve, 5000));
+                        }
+                    }
+                    
+                    if (!response || !response.ok) {
+                        console.error("Python API Error: Failed after all retries.");
                         const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service is currently waking up or unavailable. Render free tier takes ~50 seconds to wake up. Please wait a moment and try again.]";
                         
                         if (senderSocketId) io.to(senderSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
