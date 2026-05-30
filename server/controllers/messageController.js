@@ -136,17 +136,23 @@ export const sendMessage = async (req, res) =>{
                     const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
                     
                     let response;
-                    let retries = 20; // Wait up to 100 seconds (20 * 5s) for Render cold starts
+                    let retries = 12; // Wait up to 80 seconds (16 * 5s) for Render cold starts
                     
                     while (retries > 0) {
                         try {
+                            const headers = {
+                                "Content-Type": "application/json",
+                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                            };
+
                             // 1. Force Render to wake up using a GET request (Render drops POST requests if asleep!)
-                            await fetch(`${pythonUrl}/health`).catch(() => {});
+                            // We MUST use a real browser User-Agent, otherwise Render's anti-pingbot filter ignores the wake-up request!
+                            await fetch(`${pythonUrl}/health`, { headers }).catch(() => {});
                             
                             // 2. Now send the actual POST request
                             response = await fetch(`${pythonUrl}/api/chat/stream`, {
                                 method: "POST",
-                                headers: { "Content-Type": "application/json" },
+                                headers: headers,
                                 body: JSON.stringify({
                                     message: query,
                                     user_id: senderId.toString(),

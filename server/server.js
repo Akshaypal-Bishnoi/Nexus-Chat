@@ -72,10 +72,13 @@ server.listen(PORT, () => {
 });
 
 // --- Keep Python AI Service Awake ---
-const pythonUrl = process.env.PYTHON_AI_URL || "https://nexus-chat-ai-service.onrender.com";
+const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
 const pingPython = async () => {
     try {
-        await fetch(`${pythonUrl}/health`);
+        const headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        };
+        await fetch(`${pythonUrl}/health`, { headers });
         console.log("🔄 Pinged Python AI Service to wake it up / keep it awake.");
     } catch (e) {
         console.log("⚠️ Error pinging Python AI Service.");
