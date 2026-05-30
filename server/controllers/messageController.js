@@ -140,6 +140,10 @@ export const sendMessage = async (req, res) =>{
                     
                     while (retries > 0) {
                         try {
+                            // 1. Force Render to wake up using a GET request (Render drops POST requests if asleep!)
+                            await fetch(`${pythonUrl}/health`).catch(() => {});
+                            
+                            // 2. Now send the actual POST request
                             response = await fetch(`${pythonUrl}/api/chat/stream`, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
