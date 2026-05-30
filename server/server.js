@@ -71,8 +71,18 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// ❌ Remove this for Render
-// export default server;
+// --- Keep Python AI Service Awake ---
+const pythonUrl = process.env.PYTHON_AI_URL || "https://nexus-chat-ai-service.onrender.com";
+const pingPython = async () => {
+    try {
+        await fetch(`${pythonUrl}/health`);
+        console.log("🔄 Pinged Python AI Service to wake it up / keep it awake.");
+    } catch (e) {
+        console.log("⚠️ Error pinging Python AI Service.");
+    }
+};
 
-
-
+// Ping immediately when this Node server wakes up
+pingPython();
+// And ping every 10 minutes to prevent it from going to sleep
+setInterval(pingPython, 10 * 60 * 1000);
