@@ -6,6 +6,7 @@ class MCPManager:
 
     def __init__(self):
         self.tools: List[Any] = []
+        self._sessions = {}
 
     async def connect_all(self):
         # MCP tools (filesystem, github) use npx and only work locally.
@@ -21,6 +22,7 @@ class MCPManager:
             from contextlib import AsyncExitStack
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
+            from mcp.client.sse import sse_client
 
             config_path = "mcp_config.json"
             if not os.path.exists(config_path):
@@ -35,14 +37,20 @@ class MCPManager:
             for name, details in config.get("mcpServers", {}).items():
                 try:
                     import asyncio
-                    params = StdioServerParameters(
-                        command=details.get("command"),
-                        args=details.get("args", []),
-                        env=details.get("env", None),
-                    )
+                    transport_type = details.get("transport", "stdio")
 
                     async def _connect():
-                        transport = await self._exit_stack.enter_async_context(stdio_client(params))
+                        if transport_type == "sse":
+                            url = details.get("url")
+                            transport = await self._exit_stack.enter_async_context(sse_client(url))
+                        else:
+                            params = StdioServerParameters(
+                                command=details.get("command"),
+                                args=details.get("args", []),
+                                env=details.get("env", None),
+                            )
+                            transport = await self._exit_stack.enter_async_context(stdio_client(params))
+                            
                         read, write = transport
                         session = await self._exit_stack.enter_async_context(ClientSession(read, write))
                         await session.initialize()

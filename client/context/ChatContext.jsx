@@ -53,6 +53,27 @@ export const ChatProvider = ({ children })=>{
         }
     }
 
+    // function to delete a message for everyone
+    const deleteMessage = async (messageId) => {
+        try {
+            const { data } = await axios.delete(`/api/messages/delete/${messageId}`);
+            if (data.success) {
+                setMessages((prevMessages) =>
+                    prevMessages.map((msg) =>
+                        msg._id === messageId
+                            ? { ...msg, text: null, image: null, deletedForEveryone: true }
+                            : msg
+                    )
+                );
+                toast.success("Message deleted for everyone");
+            } else {
+                toast.error(data.message);
+            }
+        } catch (error) {
+            toast.error(error.message);
+        }
+    }
+
     // function to subscribe to messages for selected user
     const subscribeToMessages = async () =>{
         if(!socket) return;
@@ -60,7 +81,7 @@ export const ChatProvider = ({ children })=>{
         socket.on("newMessage", (newMessage)=>{
             // If the message is part of the currently active 1-on-1 chat
             if(selectedUser && (newMessage.senderId === selectedUser._id || newMessage.receiverId === selectedUser._id)){
-                newMessage.seen = true;
+                newMessage.status = "read";
                 setMessages((prevMessages)=> {
                     // Prevent duplicates
                     if (prevMessages.some(m => m._id === newMessage._id)) return prevMessages;
@@ -83,6 +104,45 @@ export const ChatProvider = ({ children })=>{
                 )
             );
         });
+
+        // Listen for delivery receipts (✓✓ grey)
+        socket.on("messageDelivered", ({ messageId, messageIds }) => {
+            setMessages((prevMessages) =>
+                prevMessages.map((msg) => {
+                    // Handle single messageId (from sendMessage)
+                    if (messageId && msg._id === messageId) {
+                        return { ...msg, status: "delivered" };
+                    }
+                    // Handle batch messageIds (from user coming online)
+                    if (messageIds && messageIds.includes(msg._id)) {
+                        return { ...msg, status: "delivered" };
+                    }
+                    return msg;
+                })
+            );
+        });
+
+        // Listen for read receipts (✓✓ blue)
+        socket.on("messageRead", ({ messageIds }) => {
+            setMessages((prevMessages) =>
+                prevMessages.map((msg) =>
+                    messageIds && messageIds.includes(msg._id)
+                        ? { ...msg, status: "read" }
+                        : msg
+                )
+            );
+        });
+
+        // Listen for delete for everyone
+        socket.on("messageDeleted", ({ messageId }) => {
+            setMessages((prevMessages) =>
+                prevMessages.map((msg) =>
+                    msg._id === messageId
+                        ? { ...msg, text: null, image: null, deletedForEveryone: true }
+                        : msg
+                )
+            );
+        });
     }
 
     // function to unsubscribe from messages
@@ -90,6 +150,9 @@ export const ChatProvider = ({ children })=>{
         if(socket) {
             socket.off("newMessage");
             socket.off("updateMessage");
+            socket.off("messageDelivered");
+            socket.off("messageRead");
+            socket.off("messageDeleted");
         }
     }
 
@@ -99,7 +162,8 @@ export const ChatProvider = ({ children })=>{
     },[socket, selectedUser])
 
     const value = {
-        messages, users, selectedUser, getUsers, getMessages, sendMessage, setSelectedUser, unseenMessages, setUnseenMessages
+        messages, users, selectedUser, getUsers, getMessages, sendMessage,
+        setSelectedUser, unseenMessages, setUnseenMessages, deleteMessage
     }
 
     return (

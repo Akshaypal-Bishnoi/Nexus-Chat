@@ -5,6 +5,7 @@ import http from "http";
 import { connectDB } from "./lib/db.js";
 import userRouter from "./routes/userRoutes.js";
 import messageRouter from "./routes/messageRoutes.js";
+import groupRouter from "./routes/groupRoutes.js";
 import { Server } from "socket.io";
 
 const app = express();
@@ -21,7 +22,46 @@ io.on("connection", (socket) => {
   const userId = socket.handshake.query.userId;
   console.log("User Connected", userId);
 
-  if (userId) userSocketMap[userId] = socket.id;
+  if (userId) {
+    userSocketMap[userId] = socket.id;
+
+    // When user comes online, mark all pending "sent" messages to them as "delivered"
+    (async () => {
+      try {
+        const { default: Message } = await import("./models/Message.js");
+        const pendingMessages = await Message.find({
+          receiverId: userId,
+          status: "sent"
+        });
+
+        if (pendingMessages.length > 0) {
+          await Message.updateMany(
+            { receiverId: userId, status: "sent" },
+            { status: "delivered" }
+          );
+
+          // Notify each sender that their messages were delivered
+          const senderIds = [...new Set(pendingMessages.map(m => m.senderId.toString()))];
+          senderIds.forEach(senderId => {
+            const senderSocketId = userSocketMap[senderId];
+            if (senderSocketId) {
+              const messageIds = pendingMessages
+                .filter(m => m.senderId.toString() === senderId)
+                .map(m => m._id);
+              io.to(senderSocketId).emit("messageDelivered", { messageIds });
+            }
+          });
+        }
+        // Auto-join user into their group Socket.IO rooms
+        const { default: Group } = await import("./models/Group.js");
+        const groups = await Group.find({ "members.user": userId });
+        groups.forEach(g => socket.join(`group_${g._id}`));
+      } catch (e) {
+        console.log("Socket connect setup error:", e.message);
+      }
+    })();
+  }
+
   io.emit("getOnlineUsers", Object.keys(userSocketMap));
 
   socket.on("disconnect", () => {
@@ -41,6 +81,7 @@ app.get("/api/status", (req, res) => {
 });
 app.use("/api/auth", userRouter);
 app.use("/api/messages", messageRouter);
+app.use("/api/groups", groupRouter);
 
 // DB
 await connectDB();
@@ -71,21 +112,3 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
 
-// --- Keep Python AI Service Awake ---
-const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
-const pingPython = async () => {
-    try {
-        const headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        };
-        await fetch(`${pythonUrl}/health`, { headers });
-        console.log("🔄 Pinged Python AI Service to wake it up / keep it awake.");
-    } catch (e) {
-        console.log("⚠️ Error pinging Python AI Service.");
-    }
-};
-
-// Ping immediately when this Node server wakes up
-pingPython();
-// And ping every 10 minutes to prevent it from going to sleep
-setInterval(pingPython, 10 * 60 * 1000);

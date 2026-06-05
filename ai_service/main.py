@@ -37,6 +37,11 @@ class EmbedRequest(BaseModel):
     chat_id: str
     sender_id: str
 
+class GroupSummaryRequest(BaseModel):
+    chat_history: str
+    group_name: str
+    new_member_name: str
+
 # ── Initialization with Retry ──
 MAX_RETRIES = 10
 RETRY_DELAY = 15  # seconds between retries
@@ -202,6 +207,36 @@ async def chat_stream_endpoint(req: ChatRequest):
 
     return StreamingResponse(generate(), media_type="text/plain")
 
+@app.post("/api/group/summary")
+async def generate_group_summary(req: GroupSummaryRequest):
+    """Generate a concise summary of group chat history for a new member."""
+    try:
+        from langchain_openai import ChatOpenAI
+        from langchain_core.messages import HumanMessage as SummaryMessage
+
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+
+        prompt = f"""Summarize this group chat "{req.group_name}" for {req.new_member_name} who just joined.
+
+Cover:
+1. **Main Topics** — What was discussed?
+2. **Key Decisions** — Any conclusions or agreements?
+3. **Action Items** — Pending tasks or follow-ups?
+4. **Active Members** — Who contributed most?
+
+Max 300 words. Be friendly and welcoming.
+
+Chat History:
+{req.chat_history}"""
+
+        response = await llm.ainvoke([SummaryMessage(content=prompt)])
+        return {"summary": response.content}
+    except Exception as e:
+        print(f"Summary generation error: {e}")
+        return {"summary": f"Could not generate summary: {str(e)}"}
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 8000))
+    host = "0.0.0.0" if os.environ.get("RENDER") else "127.0.0.1"
+    uvicorn.run("main:app", host=host, port=port, reload=not os.environ.get("RENDER"))

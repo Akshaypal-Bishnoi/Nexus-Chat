@@ -1,14 +1,51 @@
 import React, { useContext, useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import assets, { messagesDummyData } from '../assets/assets'
 import { formatMessageTime } from '../lib/utils'
 import { ChatContext } from '../../context/ChatContext'
 import { AuthContext } from '../../context/AuthContext'
 import toast from 'react-hot-toast'
 
+// Read receipt tick component
+const MessageStatus = ({ status, isSender }) => {
+    if (!isSender) return null;
+
+    if (status === "read") {
+        return (
+            <span className="ml-1 inline-flex" title="Read">
+                <svg className="w-4 h-4 text-blue-400" viewBox="0 0 24 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="1 6 4 9 10 3" />
+                    <polyline points="7 6 10 9 16 3" />
+                </svg>
+            </span>
+        );
+    }
+
+    if (status === "delivered") {
+        return (
+            <span className="ml-1 inline-flex" title="Delivered">
+                <svg className="w-4 h-4 text-gray-400" viewBox="0 0 24 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="1 6 4 9 10 3" />
+                    <polyline points="7 6 10 9 16 3" />
+                </svg>
+            </span>
+        );
+    }
+
+    // "sent" — single tick
+    return (
+        <span className="ml-1 inline-flex" title="Sent">
+            <svg className="w-4 h-4 text-gray-400" viewBox="0 0 24 12" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="2 6 6 10 14 2" />
+            </svg>
+        </span>
+    );
+};
+
 const ChatContainer = () => {
 
     const { messages, selectedUser, setSelectedUser, sendMessage, 
-        getMessages} = useContext(ChatContext)
+        getMessages, deleteMessage} = useContext(ChatContext)
 
     const { authUser, onlineUsers } = useContext(AuthContext)
 
@@ -16,6 +53,7 @@ const ChatContainer = () => {
 
     const [input, setInput] = useState('');
     const [isUploading, setIsUploading] = useState(false);
+    const [contextMenu, setContextMenu] = useState(null); // { messageId, x, y }
 
     // Handle sending a message
     const handleSendMessage = async (e)=>{
@@ -80,6 +118,34 @@ const ChatContainer = () => {
         }
     }
 
+    // Handle right-click context menu for delete
+    const handleContextMenu = (e, msg) => {
+        // Only show delete option for sender's own messages that aren't already deleted, or AI messages triggered by this user
+        const isMine = msg.senderId?.toString() === authUser._id?.toString();
+        const canDelete = isMine || msg.triggeredBy?.toString() === authUser._id?.toString();
+
+        if (canDelete && !msg.deletedForEveryone) {
+            e.preventDefault();
+            setContextMenu({ messageId: msg._id, x: e.clientX, y: e.clientY });
+        }
+    }
+
+    // Handle delete for everyone
+    const handleDeleteForEveryone = async (e) => {
+        e.stopPropagation();
+        if (contextMenu) {
+            await deleteMessage(contextMenu.messageId);
+            setContextMenu(null);
+        }
+    }
+
+    // Close context menu on click outside
+    useEffect(() => {
+        const handleClick = () => setContextMenu(null);
+        document.addEventListener("click", handleClick);
+        return () => document.removeEventListener("click", handleClick);
+    }, []);
+
     useEffect(()=>{
         if(selectedUser){
             getMessages(selectedUser._id)
@@ -106,12 +172,24 @@ const ChatContainer = () => {
       </div>
       {/* ------- chat area ------- */}
       <div className='flex flex-col h-[calc(100%-120px)] overflow-y-scroll p-3 pb-6'>
-        {messages.map((msg, index)=>(
-            <div key={index} className={`flex items-end gap-2 justify-end ${msg.senderId !== authUser._id && 'flex-row-reverse'}`}>
-                {msg.image ? (
+        {messages.map((msg, index)=> {
+            const isAI = msg.text?.startsWith('[🤖 AI Co-Pilot]');
+            const isMine = msg.senderId?.toString() === authUser._id?.toString() && !isAI;
+
+            return (
+            <div 
+                key={index} 
+                className={`flex items-end gap-2 justify-end ${!isMine && 'flex-row-reverse'}`}
+                onContextMenu={(e) => handleContextMenu(e, msg)}
+            >
+                {msg.deletedForEveryone ? (
+                    <div className={`p-3 max-w-[75%] md:text-sm font-light mb-8 italic text-gray-400 bg-gray-800/40 backdrop-blur-md border border-gray-700/50 ${isMine ? 'rounded-2xl rounded-br-sm' : 'rounded-2xl rounded-bl-sm'}`}>
+                        🚫 This message was deleted
+                    </div>
+                ) : msg.image ? (
                     <img src={msg.image} alt="" className='max-w-[230px] border border-gray-700 rounded-lg overflow-hidden mb-8'/>
                 ):(
-                    <div className={`p-3 max-w-[75%] md:text-sm font-light mb-8 break-words leading-relaxed shadow-lg ${msg.text?.startsWith('[🤖 AI Co-Pilot]') ? 'bg-gradient-to-r from-indigo-600 to-purple-600 border border-purple-400/50 shadow-[0_0_15px_rgba(168,85,247,0.3)] text-white' : 'bg-violet-500/80 backdrop-blur-md text-white'} ${msg.senderId === authUser._id ? 'rounded-2xl rounded-br-sm' : 'rounded-2xl rounded-bl-sm'}`}>
+                    <div className={`p-3 max-w-[75%] md:text-sm font-light mb-8 break-words leading-relaxed shadow-lg ${isAI ? 'bg-gradient-to-r from-indigo-600 to-purple-600 border border-purple-400/50 shadow-[0_0_15px_rgba(168,85,247,0.3)] text-white' : 'bg-violet-500/80 backdrop-blur-md text-white'} ${isMine ? 'rounded-2xl rounded-br-sm' : 'rounded-2xl rounded-bl-sm'}`}>
                         {msg.text?.startsWith('[🤖 AI Co-Pilot]') ? (
                             <div className="flex flex-col gap-1">
                                 <span className="font-bold text-xs text-purple-200 uppercase tracking-wider mb-1 flex items-center gap-1">
@@ -126,13 +204,32 @@ const ChatContainer = () => {
                     </div>
                 )}
                 <div className="text-center text-xs">
-                    <img src={msg.senderId === authUser._id ? authUser?.profilePic || assets.avatar_icon : selectedUser?.profilePic || assets.avatar_icon} alt="" className='w-7 rounded-full' />
-                    <p className='text-gray-500'>{formatMessageTime(msg.createdAt)}</p>
+                    <img src={isMine ? authUser?.profilePic || assets.avatar_icon : (isAI ? assets.logo_icon : selectedUser?.profilePic || assets.avatar_icon)} alt="" className='w-7 rounded-full' />
+                    <p className='text-gray-500 flex items-center gap-0.5'>
+                        {formatMessageTime(msg.createdAt)}
+                        <MessageStatus status={msg.status} isSender={isMine} />
+                    </p>
                 </div>
             </div>
-        ))}
+        )})}
         <div ref={scrollEnd}></div>
       </div>
+
+    {/* ------- context menu (delete for everyone) ------- */}
+    {contextMenu && createPortal(
+        <div 
+            className="fixed z-[9999] bg-gray-900 border border-gray-600 rounded-lg shadow-xl py-1 min-w-[180px]"
+            style={{ top: contextMenu.y, left: contextMenu.x }}
+        >
+            <button 
+                onClick={handleDeleteForEveryone}
+                className="w-full text-left px-4 py-2 text-sm text-red-400 hover:bg-gray-800 flex items-center gap-2"
+            >
+                🗑️ Delete for Everyone
+            </button>
+        </div>,
+        document.body
+    )}
 
 {/* ------- bottom area ------- */}
     <div className='absolute bottom-0 left-0 right-0 flex items-center gap-3 p-3'>

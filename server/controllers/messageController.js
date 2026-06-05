@@ -13,7 +13,12 @@ export const getUsersForSidebar = async (req, res)=>{
         // Count number of messages not seen
         const unseenMessages = {}
         const promises = filteredUsers.map(async (user)=>{
-            const messages = await Message.find({senderId: user._id, receiverId: userId, seen: false})
+            const messages = await Message.find({
+                senderId: user._id,
+                receiverId: userId,
+                status: { $ne: "read" },
+                deletedForEveryone: { $ne: true }
+            })
             if(messages.length > 0){
                 unseenMessages[user._id] = messages.length;
             }
@@ -37,11 +42,30 @@ export const getMessages = async (req, res) =>{
                 {senderId: myId, receiverId: selectedUserId},
                 {senderId: selectedUserId, receiverId: myId},
             ]
-        })
-        await Message.updateMany({senderId: selectedUserId, receiverId: myId}, {seen: true});
+        }).sort({ createdAt: 1 });
+
+        // Mark all unread messages from the other user as "read"
+        const unreadMessages = await Message.find({
+            senderId: selectedUserId,
+            receiverId: myId,
+            status: { $in: ["sent", "delivered"] }
+        });
+
+        if (unreadMessages.length > 0) {
+            await Message.updateMany(
+                { senderId: selectedUserId, receiverId: myId, status: { $in: ["sent", "delivered"] } },
+                { status: "read" }
+            );
+
+            // Notify the sender that their messages have been read
+            const senderSocketId = userSocketMap[selectedUserId];
+            if (senderSocketId) {
+                const messageIds = unreadMessages.map(m => m._id);
+                io.to(senderSocketId).emit("messageRead", { messageIds, readBy: myId });
+            }
+        }
 
         res.json({success: true, messages})
-
 
     } catch (error) {
         console.log(error.message);
@@ -53,11 +77,63 @@ export const getMessages = async (req, res) =>{
 export const markMessageAsSeen = async (req, res)=>{
     try {
         const { id } = req.params;
-        await Message.findByIdAndUpdate(id, {seen: true})
+        const message = await Message.findById(id);
+        
+        if (message && message.status !== "read") {
+            message.status = "read";
+            await message.save();
+            
+            // Notify the sender that their message was read
+            const senderSocketId = userSocketMap[message.senderId.toString()];
+            if (senderSocketId) {
+                io.to(senderSocketId).emit("messageRead", { messageIds: [id], readBy: req.user._id });
+            }
+        }
         res.json({success: true})
     } catch (error) {
         console.log(error.message);
         res.json({success: false, message: error.message})
+    }
+}
+
+// Delete message for everyone
+export const deleteForEveryone = async (req, res) => {
+    try {
+        const { id: messageId } = req.params;
+        const message = await Message.findById(messageId);
+
+        if (!message) {
+            return res.json({ success: false, message: "Message not found" });
+        }
+
+        // Only the sender can delete their own message in DMs
+        if (message.senderId.toString() !== req.user._id.toString()) {
+            return res.json({ success: false, message: "You can only delete your own messages" });
+        }
+
+        message.text = null;
+        message.image = null;
+        message.deletedForEveryone = true;
+        await message.save();
+
+        // Notify the receiver via Socket.IO
+        if (message.receiverId) {
+            const receiverSocketId = userSocketMap[message.receiverId];
+            if (receiverSocketId) {
+                io.to(receiverSocketId).emit("messageDeleted", { messageId: message._id });
+            }
+        }
+
+        // Also notify sender's other devices
+        const senderSocketId = userSocketMap[message.senderId];
+        if (senderSocketId) {
+            io.to(senderSocketId).emit("messageDeleted", { messageId: message._id });
+        }
+
+        res.json({ success: true });
+    } catch (error) {
+        console.log(error.message);
+        res.json({ success: false, message: error.message });
     }
 }
 
@@ -77,7 +153,8 @@ export const sendMessage = async (req, res) =>{
             senderId,
             receiverId,
             text,
-            image: imageUrl
+            image: imageUrl,
+            status: "sent"
         })
 
         // Fetch receiver to check if it's the direct AI user
@@ -88,6 +165,16 @@ export const sendMessage = async (req, res) =>{
         const receiverSocketId = userSocketMap[receiverId];
         if (receiverSocketId){
             io.to(receiverSocketId).emit("newMessage", newMessage)
+
+            // Mark as delivered since receiver's socket is connected
+            await Message.findByIdAndUpdate(newMessage._id, { status: "delivered" });
+            newMessage.status = "delivered";
+
+            // Notify sender that message was delivered
+            const senderSocketId = userSocketMap[senderId];
+            if (senderSocketId) {
+                io.to(senderSocketId).emit("messageDelivered", { messageId: newMessage._id });
+            }
         }
 
         // VECTOR DATABASE EAVESDROPPER
@@ -118,8 +205,9 @@ export const sendMessage = async (req, res) =>{
                     
                     // Create an empty placeholder message in the DB
                     let aiMessage = await Message.create({
-                        senderId: receiverId, 
-                        receiverId: senderId,
+                        senderId: isDirectAI ? receiverId : senderId, 
+                        receiverId: isDirectAI ? senderId : receiverId,
+                        triggeredBy: senderId,
                         text: aiPrefix,
                     });
 
@@ -134,51 +222,20 @@ export const sendMessage = async (req, res) =>{
 
                     // Call Python FastAPI Streaming Endpoint
                     const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
+                    const response = await fetch(`${pythonUrl}/api/chat/stream`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            message: query,
+                            user_id: senderId.toString(),
+                            chat_id: receiverId.toString(),
+                            role: isDirectAI ? "assistant" : "copilot"
+                        })
+                    });
                     
-                    let response;
-                    let retries = 12; // Wait up to 80 seconds (16 * 5s) for Render cold starts
-                    
-                    while (retries > 0) {
-                        try {
-                            const headers = {
-                                "Content-Type": "application/json",
-                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                            };
-
-                            // 1. Force Render to wake up using a GET request (Render drops POST requests if asleep!)
-                            // We MUST use a real browser User-Agent, otherwise Render's anti-pingbot filter ignores the wake-up request!
-                            await fetch(`${pythonUrl}/health`, { headers }).catch(() => {});
-                            
-                            // 2. Now send the actual POST request
-                            response = await fetch(`${pythonUrl}/api/chat/stream`, {
-                                method: "POST",
-                                headers: headers,
-                                body: JSON.stringify({
-                                    message: query,
-                                    user_id: senderId.toString(),
-                                    chat_id: receiverId.toString(),
-                                    role: isDirectAI ? "assistant" : "copilot"
-                                })
-                            });
-                            
-                            if (response.ok) {
-                                break; // Success! Exit the retry loop.
-                            }
-                            console.log(`Python API returned ${response.status}. Retrying... (${retries} left)`);
-                        } catch (e) {
-                            console.log(`Network error connecting to Python API: ${e.message}. Retrying... (${retries} left)`);
-                        }
-                        
-                        retries--;
-                        if (retries > 0) {
-                            // Wait 5 seconds before trying again
-                            await new Promise(resolve => setTimeout(resolve, 5000));
-                        }
-                    }
-                    
-                    if (!response || !response.ok) {
-                        console.error("Python API Error: Failed after all retries.");
-                        const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service is currently waking up or unavailable. Render free tier takes ~50 seconds to wake up. Please wait a moment and try again.]";
+                    if (!response.ok) {
+                        console.error("Python API Error:", response.status);
+                        const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service encountered an error. Please try again.]";
                         
                         if (senderSocketId) io.to(senderSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
                         if (receiverSocketId && receiverSocketId !== senderSocketId) io.to(receiverSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
