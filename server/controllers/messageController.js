@@ -222,20 +222,40 @@ export const sendMessage = async (req, res) =>{
 
                     // Call Python FastAPI Streaming Endpoint
                     const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
-                    const response = await fetch(`${pythonUrl}/api/chat/stream`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            message: query,
-                            user_id: senderId.toString(),
-                            chat_id: receiverId.toString(),
-                            role: isDirectAI ? "assistant" : "copilot"
-                        })
-                    });
+                    let response;
+                    let retries = 8; // Wait up to ~40 seconds for HF cold starts
                     
-                    if (!response.ok) {
-                        console.error("Python API Error:", response.status);
-                        const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service encountered an error. Please try again.]";
+                    while (retries > 0) {
+                        try {
+                            const headers = { "Content-Type": "application/json", "User-Agent": "NexusChat-Server" };
+                            
+                            // Force HF to wake up with a GET request first
+                            await fetch(`${pythonUrl}/health`, { headers }).catch(() => {});
+                            
+                            response = await fetch(`${pythonUrl}/api/chat/stream`, {
+                                method: "POST",
+                                headers: headers,
+                                body: JSON.stringify({
+                                    message: query,
+                                    user_id: senderId.toString(),
+                                    chat_id: receiverId.toString(),
+                                    role: isDirectAI ? "assistant" : "copilot"
+                                })
+                            });
+                            
+                            if (response.ok) break;
+                            console.log(`Python API returned ${response.status}. Retrying... (${retries} left)`);
+                        } catch (e) {
+                            console.log(`Network error connecting to Python API: ${e.message}. Retrying... (${retries} left)`);
+                        }
+                        
+                        retries--;
+                        if (retries > 0) await new Promise(resolve => setTimeout(resolve, 5000));
+                    }
+                    
+                    if (!response || !response.ok) {
+                        console.error("Python API Error: Failed after all retries.");
+                        const fallbackMsg = aiPrefix + "\n[⚠️ The AI Service is currently waking up from sleep. Please try again in a few seconds.]";
                         
                         if (senderSocketId) io.to(senderSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
                         if (receiverSocketId && receiverSocketId !== senderSocketId) io.to(receiverSocketId).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });

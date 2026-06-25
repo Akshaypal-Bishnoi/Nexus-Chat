@@ -206,19 +206,37 @@ export const sendGroupMessage = async (req, res) => {
                     io.to(`group_${groupId}`).emit("newGroupMessage", populatedAI);
 
                     const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
-                    const response = await fetch(`${pythonUrl}/api/chat/stream`, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            message: query,
-                            user_id: senderId.toString(),
-                            chat_id: groupId.toString(),
-                            role: "copilot"
-                        })
-                    });
+                    let response;
+                    let retries = 8; // ~40 sec wait for cold starts
+                    
+                    while (retries > 0) {
+                        try {
+                            const headers = { "Content-Type": "application/json", "User-Agent": "NexusChat-Server" };
+                            await fetch(`${pythonUrl}/health`, { headers }).catch(() => {});
+                            
+                            response = await fetch(`${pythonUrl}/api/chat/stream`, {
+                                method: "POST",
+                                headers: headers,
+                                body: JSON.stringify({
+                                    message: query,
+                                    user_id: senderId.toString(),
+                                    chat_id: groupId.toString(),
+                                    role: "copilot"
+                                })
+                            });
+                            
+                            if (response.ok) break;
+                            console.log(`Group AI returned ${response.status}. Retrying... (${retries} left)`);
+                        } catch (e) {
+                            console.log(`Group AI network error: ${e.message}. Retrying... (${retries} left)`);
+                        }
+                        
+                        retries--;
+                        if (retries > 0) await new Promise(resolve => setTimeout(resolve, 5000));
+                    }
 
-                    if (!response.ok) {
-                        const fallbackMsg = "[⚠️ The AI Service encountered an error. Please try again.]";
+                    if (!response || !response.ok) {
+                        const fallbackMsg = "[⚠️ The AI Service is currently waking up from sleep. Please try again in a few seconds.]";
                         io.to(`group_${groupId}`).emit("updateMessage", { messageId: aiMessage._id, text: fallbackMsg });
                         await Message.findByIdAndUpdate(aiMessage._id, { text: fallbackMsg });
                         return;
@@ -555,18 +573,35 @@ export const generateCatchUpSummary = async (req, res) => {
             .join("\n");
 
         const pythonUrl = process.env.PYTHON_AI_URL || "http://127.0.0.1:8000";
-        const response = await fetch(`${pythonUrl}/api/group/summary`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                chat_history: chatHistory,
-                group_name: group.name,
-                new_member_name: req.user.fullName
-            })
-        });
+        let response;
+        let retries = 8; // ~40 sec wait
+        
+        while (retries > 0) {
+            try {
+                const headers = { "Content-Type": "application/json", "User-Agent": "NexusChat-Server" };
+                await fetch(`${pythonUrl}/health`, { headers }).catch(() => {});
+                
+                response = await fetch(`${pythonUrl}/api/group/summary`, {
+                    method: "POST",
+                    headers: headers,
+                    body: JSON.stringify({
+                        chat_history: chatHistory,
+                        group_name: group.name,
+                        new_member_name: req.user.fullName
+                    })
+                });
+                
+                if (response.ok) break;
+            } catch (e) {
+                console.log(`Summary AI network error: ${e.message}. Retrying... (${retries} left)`);
+            }
+            
+            retries--;
+            if (retries > 0) await new Promise(resolve => setTimeout(resolve, 5000));
+        }
 
-        if (!response.ok) {
-            return res.json({ success: false, message: "AI Service unavailable" });
+        if (!response || !response.ok) {
+            return res.json({ success: false, message: "AI Service is waking up, please try again." });
         }
 
         const { summary } = await response.json();
